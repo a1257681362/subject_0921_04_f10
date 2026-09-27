@@ -16,6 +16,9 @@ public class TelematicsProperties {
     /** 导出文件归档根目录（按业务日 yyyyMMdd 分目录落盘） */
     private String exportDir = "data/telematics/export";
 
+    /** XML 报文归档根目录（按订单号分目录落盘） */
+    private String xmlDir = "data/telematics/xml";
+
     /** 文件往来字符集（与对方规范一致，如对方要求 GBK 改此配置） */
     private String charset = "UTF-8";
 
@@ -33,6 +36,8 @@ public class TelematicsProperties {
 
     public String getExportDir() { return exportDir; }
     public void setExportDir(String exportDir) { this.exportDir = exportDir; }
+    public String getXmlDir() { return xmlDir; }
+    public void setXmlDir(String xmlDir) { this.xmlDir = xmlDir; }
     public String getCharset() { return charset; }
     public void setCharset(String charset) { this.charset = charset; }
 }

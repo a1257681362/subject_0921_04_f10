@@ -276,6 +276,56 @@ SETTLED / ARCHIVED --冲销--> REVERSED
 
 `mvn test`：新增 6 个集成用例覆盖导出转义与空值/空串区分、CRLF 与 UTF-8、按日期归档落盘、模板下载、导入成功与同文件重复导入幂等、同设备不同文件覆盖、失败行号明细与全或无（合法行也不落库）、表头不符与引号未闭合报错。回归聚焦交车主链路：既有 RentalFlowIntegrationTest 9 用例不动、全量测试通过。
 
+## 车载定位平台 XML 报文往来（telematics-xml-1）
+
+背景：平台侧接口升级为 XML 报文收发。调度员带的新人上手慢、老办法（手拼报文）教不动——本期字段映射全部走注解：报文类上 `@XmlRoot` 声明根元素、字段上 `@XmlField(name=..., required=...)` 声明子元素，**看字段即知报文结构**，新人不用翻拼接代码。空值与缺省区分、出站按订单号归档、重发走原报文、入站解析失败进异常清单、上线前可用网点上一期租车单跑回归验证。CSV 文件往来保留并行，互不影响。
+
+### XML 规范（与平台对齐的口径）
+
+- **字符集**：固定 UTF-8（报文声明即 UTF-8；`evops.telematics.charset` 仅作用于 CSV 文件往来）；根元素 `handoverNotice`（出站交接通知）/ `deviceReport`（入站设备回执），子元素与 CSV 列同口径驼峰命名；
+- **空值与缺省区分**：字段为 null 元素整个缺省，空串写为空元素 `<remark/>`；解析时空元素得空串、缺省保持 null；
+- **往返转换无丢失**：序列化为规范形（元素按字段声明序、`&` `<` `>` 转义、回车写为 `&#13;`——XML 解析器会把裸回车归一为换行，转义后往返才不丢字符），故 `解析(序列化(x)) == x` 且再序列化逐字节一致；
+- **严格解析**：根元素不符、未识别元素、元素重复、叶子元素嵌套、必填缺失、类型不符，均报错且**消息带元素名与原因**；禁 DOCTYPE/外部实体（防 XXE）；
+- **时间格式**：`yyyy-MM-dd HH:mm:ss`（与 CSV 一致）。
+
+### 出站（我方 → 平台）：按订单号归档，重发走原报文
+
+`POST /api/telematics/xml/exports?bizDate=`（缺省当天）：该业务日每条交接生成一条报文：
+
+- 文件落盘 `data/telematics/xml/<订单号>/handover_yyyyMMdd_HHmmss_xxxx.xml`（**按订单号分目录归档**），`t_telematics_xml_message` 留归档记录（方向/类型/订单号/原报文/内容哈希/路径）；
+- 必填字段（订单号/车牌/交接类型/交接时间）缺失或含 XML 非法字符时整批失败并指明订单与元素，事务回滚、已写文件清理；
+- **重发走原报文**：`POST /api/telematics/xml/messages/{id}/resend` 逐字节沿用归档原件（content 列），不重新生成——新记录与原报文内容哈希一致即凭证，`resend_of` 指向最初原件（重发的重发也指向原件）；仅出站报文可重发。
+
+### 入站（平台 → 我方）：解析失败进异常清单
+
+`POST /api/telematics/xml/imports`（请求体即 XML 原文，`Content-Type: application/xml`）：
+
+- 解析失败（结构非法/根元素不符/未识别元素/必填缺失/类型不符）或业务校验不过（车牌/设备号超长、状态非 ONLINE/OFFLINE、备注超长）一律置 FAILED **进异常清单**（`GET /api/telematics/xml/exceptions`），错误明细带元素名与原因，业务行零写入；
+- **同内容幂等**：报文内容 SHA-256（`dedup_key` 库层唯一兜底）——同一报文重复接收直接返回首次结果（`duplicate=true`）；业务键 `(plate_no, device_no)` 唯一，不同报文重复上报同一设备按最新覆盖；
+- 回执来源可溯：`t_telematics_device_report` 新增 `xml_message_id`（与 CSV 的 `import_file_id` 二选一，CHECK 约束保证必有来源）。
+
+### 上线前回归：网点上一期租车单往返无损
+
+`GET /api/telematics/xml/regression-check?branchCode=&period=`（period=yyyy-MM，缺省上一月）：用该网点该期租车单的交接数据逐条跑"生成报文 → 解析回报 → 逐字段比对"，**只读不落库**，返回订单数/有交接订单数/校验报文数/通过数/失败数及失败明细（订单号+交接 id+哪一字段丢了）。上线前跑一轮，failed 为 0 即证明往返转换无丢失。
+
+### 接口速览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | /api/telematics/xml/exports?bizDate= | 生成指定业务日交接报文并按订单号归档（缺省当天） |
+| POST | /api/telematics/xml/messages/{id}/resend | 重发（走原报文，仅出站报文） |
+| POST | /api/telematics/xml/imports | 接收平台设备回执报文（失败进异常清单，同内容幂等） |
+| GET | /api/telematics/xml/messages?direction=&orderNo= | 报文归档查询 |
+| GET | /api/telematics/xml/messages/{id} | 报文详情（含原报文） |
+| GET | /api/telematics/xml/exceptions | 异常清单（入站解析/校验失败） |
+| GET | /api/telematics/xml/regression-check?branchCode=&period= | 回归验证（往返无损，只读） |
+
+写请求同样遵循三件套（`X-Operator` / `X-Request-No` / 可选 `X-Biz-Time`）与入口幂等。
+
+### 测试
+
+`mvn test`：新增 7 个集成用例覆盖注解映射与特殊字符转义、空值/缺省区分、按订单号归档落盘（文件与库内原报文一致）、重发逐字节一致且 resend_of 链到原件、入站合法落库与同内容幂等、结构非法/根元素不符/未识别元素进异常清单、校验不过错误带元素名且业务行零写入、网点上一期租车单回归往返无损（含缺省 period 取上一月）、编解码器全字符谱往返与严格校验（元素重复/嵌套/DOCTYPE 拦截）。
+
 ## 交车生命周期状态机（rental-fsm-1）
 
 背景：调度员带人到现场处理过几次，越级操作、误点回退、两人同时操作同一单，每次都手忙脚乱。本期把交车生命周期管住：**状态机配置驱动，合法路径集中定义，越级与回退按规则拒绝，流转历史完整可追溯；并行流转只有一个成功；新增状态不改代码。**

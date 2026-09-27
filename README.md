@@ -528,3 +528,51 @@ CLOSED 后发现数据问题 --只能追加--> 冲正单（t_turnover_correction
 ### 测试
 
 `mvn test`：新增 12 个集成用例覆盖占位成功与 25 分钟锁位截止、结束早于开始拒绝、完全重叠 409 带最近空档（11:12 起、时长不变）、缓冲边界（12 分钟允许/11 分钟拒绝，前后两侧）、可用性视图、确认成功与确认幂等、超时确认 409 且占位 EXPIRED、取消释放后同窗可重约、周期释放超时占位与二次扫描幂等、未扫描时新占位懒释放、同一辆车并发占位恰一个成功+败者拿冲突、车辆不存在/停用拦截。
+
+## 车载定位平台 XML 报文往来（telematics-2）
+
+背景：与定位平台的对接从 CSV 文件升级为 XML 报文双向往来——我方发出交接通知（平台据此启停定位跟踪），平台回传处理回执。新人照着报文就能对账：**字段注解映射、空值与缺省严格区分、报文按订单号归档、校验不过返回明确错误、重发走归档原报文；上线前用网点上一期租车单跑一轮回归验证，往返转换无丢失，解析失败进异常清单。**
+
+### 注解映射编解码（零新增依赖）
+
+`com.evops.telematics.xml` 下自研轻量编解码器 `XmlCodec`：类上 `@XmlRoot` 定根元素，字段上 `@XmlAttribute` / `@XmlElement` 映射属性与子元素（元素顺序=字段声明顺序）。解析基于 JDK DOM 并做安全加固（拒绝 DOCTYPE/外部实体，防 XXE）；未知元素/属性忽略（对方加字段向前兼容）。
+
+- **空值与缺省区分**：null → 属性/元素整体缺省，**绝不补 0/false/空串等默认值**；空串 → 自闭合元素 `<x/>`。解析时缺省 → null，`<x/>` → 空串，二者往返互不串味；
+- **明确错误**：XML 语法错误带行列号；字段校验（必填缺失/类型不符/取值越出白名单）一次全量收集，逐条“元素/属性 xxx：原因”；
+- **往返无丢失**：文本原样保留不去空白；时间口径秒级（`yyyy-MM-dd HH:mm:ss`，与 telematics-1 一致，组装时截断纳秒防精度误报）；`XmlCodec.diffMappedFields` 逐映射字段比对供回归验证。
+
+### 收发与归档
+
+- **发送** `POST /api/telematics/xml/messages/export?bizDate=`：按业务日抽取交接记录组 `handoverNotice` 报文（一交接一条），原文落库 `t_telematics_xml_message`（OUT/GENERATED）并按订单号分目录落盘 `data/telematics/xml/<orderNo>/`；单条脏数据组报文失败进异常清单（EXPORT）后继续，系统错误整批回滚；
+- **接收** `POST /api/telematics/xml/messages/receive`（text/xml）：平台 `handoverAck` 回执解析校验；**校验不过返回 400 + 逐条明确错误**（`code=XML_MESSAGE_INVALID`，`data.errors` 全量错误清单、`data.exceptionId` 异常清单 id），业务零写入；同 msgId 重复接收幂等（`duplicate=true`，`(direction,msg_id)` 唯一约束兜底）；
+- **重发** `POST /api/telematics/xml/messages/{id}/resend`：**走归档原报文**——读库内原文逐字节写重发副本，绝不从当前业务数据重新生成；`resend_count` 累计；仅 OUT 报文可重发；
+- **异常清单**：来报解析失败（INBOUND）、导出组报文失败（EXPORT）、回归验证失败（REGRESSION）统一进 `t_telematics_xml_exception`（独立事务落库，不随业务回滚）；核销 `POST /api/telematics/xml/exceptions/{id}/resolve` **原因必填**（与对账差异核销同口径）。
+
+### 上线前回归验证
+
+`POST /api/telematics/xml/regression {"branchCode":"...","periodFrom":"...","periodTo":"..."}`：抽取该网点期间内（按租车单业务时间）的租车单及交接记录，逐条“组报文 → XML → 解析回对象 → 逐字段比对”：
+
+- 全部通过：批次 `SUCCESS`；任一失败：批次 `FAILED`，失败明细进异常清单（挂 `run_id`），单条失败不影响其余单继续验证；
+- 批次汇总落 `t_telematics_xml_regression`（覆盖单数/报文数/通过/失败），次日可凭批次与异常清单逐条核对；
+- 典型可检出场景：上一期历史脏数据（如备注含 XML 1.0 非法控制字符）——该单进异常清单，清洗源头后核销。
+
+### 接口速览（新增）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | /api/telematics/xml/messages/export?bizDate= | 生成交接通知报文并按订单号归档（缺省当天；脏数据进异常清单） |
+| GET | /api/telematics/xml/messages?orderNo=&direction= | 报文归档列表 |
+| GET | /api/telematics/xml/messages/{id} | 报文详情（含原文） |
+| GET | /api/telematics/xml/messages/{id}/download | 下载归档原报文 |
+| POST | /api/telematics/xml/messages/{id}/resend | 重发（走归档原报文，逐字节一致；仅 OUT） |
+| POST | /api/telematics/xml/messages/receive | 接收平台回执（400 逐条明确错误；同 msgId 幂等） |
+| GET | /api/telematics/xml/exceptions?status=&runId= | 异常清单（OPEN 待处置 / RESOLVED 已核销） |
+| POST | /api/telematics/xml/exceptions/{id}/resolve | 核销异常（**原因必填**） |
+| POST | /api/telematics/xml/regression | 上线前回归验证（网点+期间，往返比对） |
+| GET | /api/telematics/xml/regression, /regression/{id} | 回归批次查询 |
+
+写请求同样遵循三件套（`X-Operator` / `X-Request-No` / 可选 `X-Biz-Time`）与入口幂等。归档根目录 `evops.telematics.xml-dir`（默认 `data/telematics/xml`），字符集复用 `evops.telematics.charset`。
+
+### 测试
+
+`mvn test`：新增 8 个集成用例覆盖导出注解映射与按订单号归档、特殊字符转义、null 缺省与空串 `<x/>` 区分、往返转换无丢失（含 0 与 null 不串味、前后空格保留）、接收成功归档与同 msgId 幂等、校验不过 400 逐条明确错误+异常清单+业务零写入、语法错误带行列号与 DOCTYPE 拒绝、重发走原报文（业务数据变更后逐字节一致）与重发计数、回归验证全通过、脏数据单进异常清单与核销原因必填/重复核销拒绝。既有 telematics-1 等全部用例零改动回归。

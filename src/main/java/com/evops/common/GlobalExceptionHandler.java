@@ -26,6 +26,17 @@ public class GlobalExceptionHandler {
         return ApiResponse.fail("FORBIDDEN", ex.getMessage());
     }
 
+    /** 平台来报 XML 校验未通过：400 + 逐条明确错误（异常清单已落库，exceptionId 可查） */
+    @ExceptionHandler(com.evops.telematics.xml.XmlInboundException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ApiResponse<java.util.Map<String, Object>> handleXmlInbound(
+            com.evops.telematics.xml.XmlInboundException ex) {
+        java.util.Map<String, Object> data = new java.util.LinkedHashMap<>();
+        data.put("exceptionId", ex.getExceptionId());
+        data.put("errors", ex.getErrors());
+        return ApiResponse.fail("XML_MESSAGE_INVALID", ex.getMessage(), data);
+    }
+
     /** 业务规则冲突（状态流转非法、物理删除被拒、单据不存在等） */
     @ExceptionHandler(BizException.class)
     @ResponseStatus(HttpStatus.CONFLICT)
